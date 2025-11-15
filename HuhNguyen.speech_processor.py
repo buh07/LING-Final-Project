@@ -23,6 +23,36 @@ INSTRUMENT = "piano"  # Instrument type for synthesis
 MIN_PITCH = 100.0   # Approximately G2 - lower bound for human speech, avoiding octave errors
 MAX_PITCH = 400.0   # Upper bound for typical human speech pitch
 
+# Filter Cutoff Configuration (in Hz)
+# Adjust these values to control the aggressiveness of filtering for each file
+# Format: {"file_basename": {"highpass": cutoff_hz, "lowpass": cutoff_hz}}
+FILTER_CUTOFFS = {
+    "English1": {
+        "highpass": 16000.0,  # High-pass filter cutoff (removes frequencies below this) - maximum aggressive
+        "lowpass": 90.0       # Low-pass filter cutoff (removes frequencies above this) - extremely aggressive
+    },
+    "English2": {
+        "highpass": 16500.0,  # Maximum aggressive for minimal legibility
+        "lowpass": 180.0
+    },
+    "Viet1": {
+        "highpass": 7500.0,
+        "lowpass": 160.0
+    },
+    "Viet2": {
+        "highpass": 8500.0,
+        "lowpass": 200.0      # Decreased from 250 to 200 for less legibility
+    }
+}
+
+# Volume Boost Configuration (multiplier for specific files)
+# Use this to increase volume for files that are too quiet
+VOLUME_BOOST = {
+    "Viet2_lowpass": 5.0,       # 5x boost for Viet2 low-pass filter
+    "English1_lowpass": 5.0,    # 5x boost for English1 low-pass filter
+    "English2_highpass": 10.0   # 10x boost for English2 high-pass filter
+}
+
 # Instrument Parameters
 INSTRUMENTS = {
     "piano": {
@@ -260,13 +290,14 @@ def transform_form1(signal, sample_rate):
     
     return transformed_signal
 
-def transform_form2(signal, sample_rate):
+def transform_form2(signal, sample_rate, file_basename=None):
     """Apply a high-pass filter to the input audio signal.
-    This filter is dynamically tuned to make speech unintelligible while retaining sound.
+    This filter can use configured cutoffs or dynamic tuning to make speech unintelligible while retaining sound.
     
     Args:
         signal (numpy.ndarray): The input audio signal
         sample_rate (int): The sampling rate of the signal in Hz
+        file_basename (str, optional): Base name of the file to look up configured cutoff
         
     Returns:
         numpy.ndarray: The high-pass filtered signal
@@ -290,35 +321,51 @@ def transform_form2(signal, sample_rate):
             y = np.pad(y, (0, len(data) - len(y)))
         return y
 
-    # Compute the signal's spectral centroid to find where most energy is
-    spectral_centroids = librosa.feature.spectral_centroid(y=signal, sr=sample_rate, hop_length=HOP_LENGTH)[0]
-    median_centroid = np.median(spectral_centroids[spectral_centroids > 0])
-    
-    # Set cutoff to be well above speech formants (typically 500-3500 Hz)
-    # This removes intelligibility while keeping high-frequency content
-    # Use 1.5x the median centroid, clamped between 3000-5000 Hz
-    cutoff = min(max(median_centroid * 1.5, 3000.0), 5000.0)
+    # Check if we have a configured cutoff for this file
+    if file_basename and file_basename in FILTER_CUTOFFS:
+        cutoff = FILTER_CUTOFFS[file_basename]["highpass"]
+    else:
+        # Fallback to dynamic calculation
+        # Compute the signal's spectral centroid to find where most energy is
+        spectral_centroids = librosa.feature.spectral_centroid(y=signal, sr=sample_rate, hop_length=HOP_LENGTH)[0]
+        median_centroid = np.median(spectral_centroids[spectral_centroids > 0])
+        
+        # Set cutoff to be well above speech formants (typically 500-3500 Hz)
+        # This removes intelligibility while keeping high-frequency content
+        # Use 2.5x the median centroid, clamped between 5000-8000 Hz for more aggressive filtering
+        cutoff = min(max(median_centroid * 2.5, 5000.0), 8000.0)
     
     filtered_signal = highpass_filter(signal.copy(), cutoff, sample_rate, order=5)
     
-    # Check if signal is too quiet and apply adaptive amplification
-    max_amplitude = np.max(np.abs(filtered_signal))
-    if max_amplitude < 0.01:
-        # Signal is very quiet, apply stronger amplification
-        amplification = min(0.3 / max(max_amplitude, 1e-6), 20.0)
-    else:
-        amplification = 3.0
+    # Normalize first to get the signal to -1.0 to 1.0 range
+    filtered_signal = librosa.util.normalize(filtered_signal)
     
-    filtered_signal = librosa.util.normalize(filtered_signal) * amplification
+    # Apply dynamic amplification to make audio audible but not too loud
+    # Calculate the current peak level
+    max_amplitude = np.max(np.abs(filtered_signal))
+    
+    # Set target amplitude higher for better audibility
+    # 0.95 = -0.4 dB (loud but with slight headroom to prevent clipping)
+    target_amplitude = 0.95
+    
+    # Check if this file needs extra volume boost
+    boost_key = f"{file_basename}_highpass" if file_basename else None
+    volume_boost = VOLUME_BOOST.get(boost_key, 1.0)
+    
+    # Calculate amplification needed, with a higher floor for very quiet signals
+    if max_amplitude > 0:
+        amplification = min(target_amplitude / max_amplitude, 50.0) * volume_boost
+        filtered_signal = filtered_signal * amplification
     return filtered_signal
 
-def transform_form3(signal, sample_rate):
+def transform_form3(signal, sample_rate, file_basename=None):
     """Apply a low-pass filter to the input audio signal.
-    This filter is dynamically tuned to make speech unintelligible while retaining sound.
+    This filter can use configured cutoffs or dynamic tuning to make speech unintelligible while retaining sound.
     
     Args:
         signal (numpy.ndarray): The input audio signal
         sample_rate (int): The sampling rate of the signal in Hz
+        file_basename (str, optional): Base name of the file to look up configured cutoff
         
     Returns:
         numpy.ndarray: The low-pass filtered signal
@@ -342,42 +389,58 @@ def transform_form3(signal, sample_rate):
             y = np.pad(y, (0, len(data) - len(y)))
         return y
 
-    # Analyze signal's pitch content to set an appropriate cutoff
-    # Extract fundamental frequency to understand speech range
-    try:
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            signal,
-            fmin=librosa.note_to_hz('C2'),
-            fmax=librosa.note_to_hz('C7'),
-            sr=sample_rate,
-            frame_length=FRAME_SIZE,
-            hop_length=HOP_LENGTH,
-        )
-        # Use median pitch of voiced frames
-        voiced_pitches = f0[~np.isnan(f0)]
-        if len(voiced_pitches) > 0:
-            median_pitch = np.median(voiced_pitches)
-        else:
-            median_pitch = 200.0  # Default fallback
-    except Exception:
-        median_pitch = 200.0  # Fallback if pitch detection fails
-    
-    # Set cutoff to remove most formants but keep fundamental and some harmonics
-    # This keeps a "muffled" sound but removes intelligibility
-    # Use 40-60% of median pitch, clamped between 250-500 Hz
-    cutoff = min(max(median_pitch * 1.8, 250.0), 500.0)
+    # Check if we have a configured cutoff for this file
+    if file_basename and file_basename in FILTER_CUTOFFS:
+        cutoff = FILTER_CUTOFFS[file_basename]["lowpass"]
+    else:
+        # Fallback to dynamic calculation
+        # Analyze signal's pitch content to set an appropriate cutoff
+        # Extract fundamental frequency to understand speech range
+        try:
+            f0, voiced_flag, voiced_probs = librosa.pyin(
+                signal,
+                fmin=librosa.note_to_hz('C2'),
+                fmax=librosa.note_to_hz('C7'),
+                sr=sample_rate,
+                frame_length=FRAME_SIZE,
+                hop_length=HOP_LENGTH,
+            )
+            # Use median pitch of voiced frames
+            voiced_pitches = f0[~np.isnan(f0)]
+            if len(voiced_pitches) > 0:
+                median_pitch = np.median(voiced_pitches)
+            else:
+                median_pitch = 200.0  # Default fallback
+        except Exception:
+            median_pitch = 200.0  # Fallback if pitch detection fails
+        
+        # Set cutoff to remove most formants but keep fundamental and some harmonics
+        # This keeps a "muffled" sound but removes intelligibility
+        # Use lower cutoff for more aggressive filtering, clamped between 150-300 Hz
+        cutoff = min(max(median_pitch * 1.0, 150.0), 300.0)
     
     filtered_signal = lowpass_filter(signal.copy(), cutoff, sample_rate, order=5)
     
-    # Check if signal is too quiet and apply adaptive amplification
-    max_amplitude = np.max(np.abs(filtered_signal))
-    if max_amplitude < 0.01:
-        # Signal is very quiet, apply stronger amplification
-        amplification = min(0.3 / max(max_amplitude, 1e-6), 20.0)
-    else:
-        amplification = 3.0
+    # Normalize first to get the signal to -1.0 to 1.0 range
+    filtered_signal = librosa.util.normalize(filtered_signal)
     
-    filtered_signal = librosa.util.normalize(filtered_signal) * amplification
+    # Apply dynamic amplification to make audio audible but not too loud
+    # Calculate the current peak level
+    max_amplitude = np.max(np.abs(filtered_signal))
+    
+    # Set target amplitude higher for better audibility
+    # 0.95 = -0.4 dB (loud but with slight headroom to prevent clipping)
+    target_amplitude = 0.95
+    
+    # Check if this file needs extra volume boost
+    boost_key = f"{file_basename}_lowpass" if file_basename else None
+    volume_boost = VOLUME_BOOST.get(boost_key, 1.0)
+    
+    # Calculate amplification needed, with a higher floor for very quiet signals
+    if max_amplitude > 0:
+        amplification = min(target_amplitude / max_amplitude, 50.0) * volume_boost
+        filtered_signal = filtered_signal * amplification
+    
     return filtered_signal
 
 def transform_form4(signal, sample_rate):
@@ -527,14 +590,14 @@ def main(file_name):
     # Load the audio track from the input (moviepy/librosa handled in load_audio)
     signal, sample_rate = load_audio(input_file)
 
-    # Apply transformations
-    form1 = transform_form1(signal, sample_rate)
-    form2 = transform_form2(signal, sample_rate)
-    form3 = transform_form3(signal, sample_rate)
-    form4 = transform_form4(signal, sample_rate)
-
     # Extract just the base name from the file path (remove directory)
     base_name = os.path.basename(file_name)
+
+    # Apply transformations, passing the base name for configured cutoffs
+    form1 = transform_form1(signal, sample_rate)
+    form2 = transform_form2(signal, sample_rate, file_basename=base_name)
+    form3 = transform_form3(signal, sample_rate, file_basename=base_name)
+    form4 = transform_form4(signal, sample_rate)
     
     # Define output paths for each transformation (use .m4a for audio outputs)
     output_paths = [
