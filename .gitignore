@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Audio/Video files
+*.m4a
+*.mp4
+*.mp3
+*.wav
+*.MOV
+*.mov
+
+# Output directories
+output/
+backup_output/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Archives
+*.zip
+
+# PDF documents
+*.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+venv/
+env/
+ENV/
